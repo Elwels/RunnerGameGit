@@ -70,7 +70,8 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-renderer.setAnimationLoop(animate);
+// (Quitamos renderer.setAnimationLoop(animate): ya tenemos el bucle propio "bucle()" al final.
+//  Tener dos bucles dibujaba la escena dos veces por cuadro.)
 document.body.appendChild(renderer.domElement);
 
 const light = new THREE.AmbientLight( 0x404040, 50); // soft white light
@@ -125,6 +126,9 @@ function construirNivel() {
             if (SOLIDOS.has(element)) {
                 // Crear un bloque sólido
                 crearBloque(index, yMundo, element);
+            } else if (element === "P") {
+                // Guardar dónde empieza el jugador (+0.5 = centro de la casilla)
+                posicionInicial = { x: index + 0.5, y: yMundo };
             }
         }
 
@@ -143,7 +147,7 @@ texTierraRelleno.wrapS = THREE.RepeatWrapping;
 texTierraRelleno.wrapT = THREE.RepeatWrapping;
 texTierraRelleno.repeat.set(1, 4);
 const texSueloLado = textureLoader.load('./src/img/texture/suelo-lado.jpg');  // lados del suelo (ground + borde de pasto)
-const texSorpresa  = textureLoader.load('./src/img/texture/sorpresa.png');
+const texSorpresa  = textureLoader.load('./src/img/texture/sorpresa.jpg');
 const texUsado     = textureLoader.load('./src/img/texture/usado.jpg');
 const texPiedra    = textureLoader.load('./src/img/texture/piedra.jpg');
 const texColumna   = textureLoader.load('./src/img/texture/columna.jpg');
@@ -239,6 +243,335 @@ const ui = {
 document.getElementById("btn-jugar").addEventListener('click', iniciarJuego);
 document.getElementById("btn-reiniciar").addEventListener('click', iniciarJuego);
 
+
+function alternarPausa() {
+    if(estado === 'jugando'){
+        estado = 'pausa';
+        ui.pausa.classList.remove('oculto');
+    }else if(estado === 'pausa'){   // solo se reanuda si ESTABA en pausa (no desde 'inicio')
+        estado = 'jugando';
+        ui.pausa.classList.add('oculto');
+        reloj.getDelta(); // descartamos el tiempo que pasó en pausa
+    }
+}
+
+// ********************************************
+// Personaje
+// ********************************************
+//Crear malla y ubicarlas
+function pieza(geometria, material, x, y, z) {
+    const malla = new THREE.Mesh(geometria,material);
+    malla.position.set(x,y,z);
+    malla.castShadow = true;
+    return malla;
+}
+
+function crearModeloJugador() {
+    const grupo = new THREE.Group();
+    const matCuerpo = new THREE.MeshLambertMaterial({color: 0x2ec4b6});
+    const matOscuro = new THREE.MeshLambertMaterial({color: 0x1b2a41});
+    const matLuz = new THREE.MeshLambertMaterial({color: 0xffd23f, emissive:0x664400});
+    const matOjo = new THREE.MeshBasicMaterial({color: 0x7df9ff});
+
+    // Piernas
+    const piernaIzq = pieza(new THREE.BoxGeometry(0.16,0.2,0.22), matOscuro, -0.14, 0.1, 0);
+    const piernaDer = pieza(new THREE.BoxGeometry(0.16,0.2,0.22), matOscuro, 0.14, 0.1, 0);
+    // Cuerpo
+    const cuerpo = pieza(new THREE.BoxGeometry(0.6,0.4,0.48), matCuerpo, 0,0.4,0);
+    // Cabeza
+    const cabeza = pieza(new THREE.BoxGeometry(0.56,0.34,0.5), matCuerpo, 0,0.77,0);
+    const visor = pieza(new THREE.BoxGeometry(0.46,0.2,0.04), matOscuro, 0,0.78,0.26);
+    const ojoIzq = pieza(new THREE.BoxGeometry(0.08,0.1,0.02), matOjo, -0.1, 0.79, 0.285);
+    const ojoDerecho = pieza(new THREE.BoxGeometry(0.08,0.1,0.02), matOjo, 0.1, 0.79, 0.285);
+    // Antena
+    const antena = pieza(new THREE.CylinderGeometry(0.025,0.025,0.2), matOscuro, 0, 1.03, 0);
+    const foco = pieza(new THREE.SphereGeometry(0.07,12,12), matLuz, 0, 1.15,0);
+    // Mochila
+    const mochila = pieza(new THREE. BoxGeometry(0.4,0.32,0.14), matLuz,0,0.42,-0.3);
+
+    grupo.add(piernaIzq,piernaDer,cuerpo, cabeza,visor,ojoIzq, ojoDerecho, antena, foco, mochila);
+    grupo.userData = {piernaIzq, piernaDer};
+    return grupo;
+
+}
+
+// ********************************************
+// Jugador
+// ********************************************
+const jugador ={
+    x:0,
+    y:0,
+    vx:0, 
+    vy:0,
+    ancho: 0.7,
+    alto:0.9,
+    enSuelo: false,
+    mirando: 1, // 1=Derecha, -1 = Izquierda
+    tiempoCoyote: 0,
+    bufferSalto: 0,
+    saltando: false,
+    invulnerable: 0,
+    tiempoAnimacion: 0,
+    malla: crearModeloJugador()
+}
+
+scene.add(jugador.malla);
+
+// Ubica al jugador en la "P" del mapa (o en el punto de control si ya se activó)
+function reaparecerJugador() {
+    const inicio = (puntoControl && puntoControl.activo) ? puntoControl : posicionInicial;
+    jugador.x = inicio.x;
+    jugador.y = inicio.y;
+    jugador.vx = 0;
+    jugador.vy = 0;
+    jugador.mirando = 1;
+    jugador.malla.rotation.set(0, 0, 0);
+    jugador.malla.visible = true;
+}
+
+// ********************************************
+// FÍSICA Y COLISIONES (AABB contra la grilla)
+// Movemos primero en X y resolvemos choques, y LUEGO en Y.
+// Toda entidad tiene: x (centro), y (pies), ancho, alto, vx, vy.
+// ********************************************
+function obtenerBloque(tx, ty) {
+    return bloques.get(clave(tx, ty)) || null;
+}
+
+// Devuelve los bloques sólidos que se cruzan con la caja de la entidad
+function bloquesQueToca(ent) {
+    const resultado = [];
+    const izquierda = Math.floor(ent.x - ent.ancho / 2);
+    const derecha = Math.floor(ent.x + ent.ancho / 2 - 0.001);
+    const abajo = Math.floor(ent.y);
+    const arriba = Math.floor(ent.y + ent.alto - 0.001);
+
+    for (let tx = izquierda; tx <= derecha; tx++) {
+        for (let ty = abajo; ty <= arriba; ty++) {
+            const b = obtenerBloque(tx, ty);
+            if (b) resultado.push(b);
+        }
+    }
+    return resultado;
+}
+
+// Mueve la entidad según su velocidad y la saca de los bloques con los que choque
+function moverEntidad(ent, dt, alGolpearTecho) {
+    ent.chocoPared = false;
+
+    // --- Eje X ---
+    ent.x += ent.vx * dt;
+    let choques = bloquesQueToca(ent);
+    if (choques.length > 0) {
+        if (ent.vx > 0) {
+            ent.x = Math.min(...choques.map(b => b.x)) - ent.ancho / 2 - 0.001;
+        } else if (ent.vx < 0) {
+            ent.x = Math.max(...choques.map(b => b.x)) + 1 + ent.ancho / 2 + 0.001;
+        }
+        ent.vx = 0;
+        ent.chocoPared = true;
+    }
+
+    // --- Eje Y ---
+    ent.y += ent.vy * dt;
+    ent.enSuelo = false;
+    choques = bloquesQueToca(ent);
+    if (choques.length > 0) {
+        if (ent.vy < 0) {
+            // Cayendo: aterriza encima del bloque
+            ent.y = Math.max(...choques.map(b => b.y)) + 1;
+            ent.enSuelo = true;
+        } else if (ent.vy > 0) {
+            // Subiendo: se golpea la cabeza
+            ent.y = Math.min(...choques.map(b => b.y)) - ent.alto - 0.001;
+            if (alGolpearTecho) alGolpearTecho(choques);
+        }
+        ent.vy = 0;
+    }
+}
+
+
+function actualizarJugador(dt) {
+  const j = jugador;
+
+  // --- Movimiento horizontal con aceleración y fricción ---
+  let direccion = 0;
+  if (teclaIzquierda()) direccion -= 1;
+  if (teclaDerecha()) direccion += 1;
+  const velocidadMaxima = teclaCorrer() ? CONFIG.VEL_CORRER : CONFIG.VEL_CAMINAR;
+
+  if (direccion !== 0) {
+    j.vx += direccion * CONFIG.ACELERACION * dt;
+    j.vx = Math.max(-velocidadMaxima, Math.min(velocidadMaxima, j.vx)); // limitar (clamp)
+    j.mirando = direccion;
+  } else {
+    // Fricción: reducimos la velocidad poco a poco hasta llegar a 0
+    const freno = CONFIG.FRICCION * dt;
+    j.vx = Math.abs(j.vx) <= freno ? 0 : j.vx - Math.sign(j.vx) * freno;
+  }
+
+  // --- Salto ---
+  // "Coyote time": unos milisegundos de gracia para saltar después de dejar el borde
+  j.tiempoCoyote = j.enSuelo ? CONFIG.TIEMPO_COYOTE : j.tiempoCoyote - dt;
+  j.bufferSalto -= dt;
+
+  if (j.bufferSalto > 0 && j.tiempoCoyote > 0) {
+    j.vy = CONFIG.FUERZA_SALTO;
+    j.bufferSalto = 0;
+    j.tiempoCoyote = 0;
+    j.saltando = true;
+    //sonido('salto');   // se activa cuando hagamos la sección de sonidos
+  }
+
+  // Salto variable: si sueltas el botón mientras subes, el salto se corta
+  if (j.saltando && !teclaSaltoPresionada() && j.vy > 0) {
+    j.vy *= CONFIG.CORTE_SALTO;
+    j.saltando = false;
+  }
+  if (j.vy <= 0) j.saltando = false;
+
+  // --- Gravedad ---
+  j.vy += CONFIG.GRAVEDAD * dt;
+  j.vy = Math.max(j.vy, CONFIG.VEL_MAX_CAIDA);
+
+  // --- Mover y resolver colisiones ---
+  // (golpearBloque se agrega cuando hagamos la sección de romper bloques)
+  moverEntidad(j, dt);
+
+  // No dejar que salga por el borde izquierdo del mundo
+  if (j.x < j.ancho / 2) { j.x = j.ancho / 2; j.vx = 0; }
+
+  // --- ¿Se cayó al vacío? ---
+  if (j.y < CONFIG.LIMITE_CAIDA) {
+    //perderVida(false);
+    reaparecerJugador();   // provisional: mientras no hay vidas, vuelve al inicio
+    return;
+  }
+
+  // --- Recoger gemas ---
+//   gemas.forEach(g => {
+//     if (!g.recogida && seSuperponen(j, { x: g.x + 0.5, y: g.y + 0.15, ancho: 0.6, alto: 0.7 })) {
+//       g.recogida = true;
+//       grupoNivel.remove(g.malla);
+//       sumarGema(100);
+//     }
+//   });
+
+  // --- Punto de control ---
+  if (puntoControl && !puntoControl.activo && j.x >= puntoControl.x) {
+    puntoControl.activo = true;
+    puntoControl.bandera.userData.tela.material.color.set(0x4caf50); // se pone verde
+    mostrarAviso('¡PUNTO DE CONTROL!');
+    //sonido('vida');
+  }
+
+  // --- Meta ---
+//   if (meta && j.x >= meta.x - 0.2) {
+//     ganarNivel();
+//   }
+
+  if (j.invulnerable > 0) j.invulnerable -= dt;
+  actualizarModeloJugador(dt);
+}
+
+// Sincroniza el modelo 3D con los datos del jugador y lo anima
+function actualizarModeloJugador(dt) {
+  const j = jugador;
+  const m = j.malla;
+  m.position.set(j.x, j.y, 0);
+
+  // Girar suavemente hacia donde mira (no 90° completos, para que se vea la cara)
+  const anguloObjetivo = j.mirando * 0.9;
+  m.rotation.y += (anguloObjetivo - m.rotation.y) * Math.min(1, 12 * dt);
+
+  // Animación de caminar: las piernas se balancean con una función seno
+  const { piernaIzq, piernaDer } = m.userData;
+  if (j.enSuelo && Math.abs(j.vx) > 0.5) {
+    j.tiempoAnimacion += dt * Math.abs(j.vx) * 2.2;
+    piernaIzq.position.y = 0.1 + Math.max(0, Math.sin(j.tiempoAnimacion)) * 0.08;
+    piernaDer.position.y = 0.1 + Math.max(0, -Math.sin(j.tiempoAnimacion)) * 0.08;
+  } else {
+    piernaIzq.position.y = piernaDer.position.y = 0.1;
+  }
+
+  // "Squash & stretch": se estira al subir y se aplasta al caer (principio de animación)
+  const estirar = j.enSuelo ? 1 : 1 + Math.max(-0.15, Math.min(0.15, j.vy * 0.015));
+  m.scale.set(2 - estirar, estirar, 2 - estirar);
+
+  // Parpadeo mientras es invulnerable
+  m.visible = j.invulnerable > 0 ? Math.floor(j.invulnerable * 12) % 2 === 0 : true;
+}
+
+// ---------- Enemigo: un "blob" morado con ojos ----------
+function crearModeloEnemigo() {
+  const grupo = new THREE.Group();
+  const matCuerpo = new THREE.MeshLambertMaterial({ color: 0x9b5de5 });
+  const matBlanco = new THREE.MeshBasicMaterial({ color: 0xffffff });
+  const matNegro = new THREE.MeshBasicMaterial({ color: 0x111111 });
+
+  const cuerpo = pieza(new THREE.SphereGeometry(0.42, 20, 16), matCuerpo, 0, 0.32, 0);
+  cuerpo.scale.set(1, 0.78, 0.9);     // achatamos la esfera
+  const ojoIzq = pieza(new THREE.SphereGeometry(0.1, 10, 10), matBlanco, -0.14, 0.42, 0.3);
+  const ojoDer = pieza(new THREE.SphereGeometry(0.1, 10, 10), matBlanco, 0.14, 0.42, 0.3);
+  const pupIzq = pieza(new THREE.SphereGeometry(0.05, 8, 8), matNegro, -0.14, 0.42, 0.39);
+  const pupDer = pieza(new THREE.SphereGeometry(0.05, 8, 8), matNegro, 0.14, 0.42, 0.39);
+  // Cejas enojadas
+  const cejaIzq = pieza(new THREE.BoxGeometry(0.16, 0.04, 0.04), matNegro, -0.14, 0.55, 0.33);
+  cejaIzq.rotation.z = -0.4;
+  const cejaDer = pieza(new THREE.BoxGeometry(0.16, 0.04, 0.04), matNegro, 0.14, 0.55, 0.33);
+  cejaDer.rotation.z = 0.4;
+
+  grupo.add(cuerpo, ojoIzq, ojoDer, pupIzq, pupDer, cejaIzq, cejaDer);
+  return grupo;
+}
+
+// ---------- Bandera (meta) y punto de control ----------
+function crearBandera(alto, colorTela) {
+  const grupo = new THREE.Group();
+  const matPoste = new THREE.MeshLambertMaterial({ color: 0xeeeeee });
+  const matTela = new THREE.MeshLambertMaterial({ color: colorTela, side: THREE.DoubleSide });
+  grupo.add(pieza(new THREE.CylinderGeometry(0.06, 0.06, alto), matPoste, 0, alto / 2, 0));
+  grupo.add(pieza(new THREE.SphereGeometry(0.14, 12, 12), MATERIALES.sorpresa, 0, alto + 0.1, 0));
+  const tela = pieza(new THREE.BoxGeometry(0.9, 0.6, 0.04), matTela, -0.48, alto - 0.4, 0);
+  grupo.add(tela);
+  grupo.userData.tela = tela;
+  return grupo;
+}
+
+// ********************************************
+// ENTRADA DE TECLADO
+// ********************************************
+const teclas = {};
+window.addEventListener('keydown', (e) => {
+    teclas[e.code] = true;
+
+    // Evita que la pagina haga scroll con el espacio o las flechas
+    if(['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+
+    // validar el salto
+    // Buffer de Salto (Solo salta al presionar, pero no mantiene el salto)
+    if(!e.repeat && esTeclaSalto(e.code) && estado==='jugando'){
+        jugador.bufferSalto = CONFIG.BUFFER_SALTO;
+    }
+
+    if(e.code === 'KeyP') alternarPausa();
+    if(e.code === 'KeyR' && estado!=='inicio') iniciarJuego();
+    // Ojo con los paréntesis: el || debe quedar DENTRO, si no, cualquier tecla reinicia en gameover
+    if(e.code === 'Enter' && (estado==='inicio' || estado==='gameover' || estado==='victoria')) iniciarJuego();
+
+});
+
+window.addEventListener('keyup', (e) => {teclas[e.code] = false;});
+
+
+const esTeclaSalto = (code) => code === 'Space' || code === 'ArrowUp' || code === 'KeyW';
+const teclaIzquierda = () => teclas['ArrowLeft'] || teclas['KeyA'];
+const teclaDerecha = () => teclas['ArrowRight'] || teclas['KeyD'];
+const teclaSaltoPresionada = () => teclas['Space'] || teclas['ArrowUp'] || teclas['KeyW'];
+const teclaCorrer = () => teclas['ShiftLeft'] || teclas['ShiftRight'];
+
+
+
 // ********************************************
 // Variables de juego
 // ESTADO DE JUEGO Y EL BUCLE
@@ -255,22 +588,81 @@ function iniciarJuego() {
 
     vidas = CONFIG.VIDAS_INICIALES;
     puntos = 0;
-    //gemasRecogidas = 0;
+    gemasRecogidas = 0;
     tiempoRestante = CONFIG.TIEMPO_NIVEL;
     puntoControl = null;
     banderaMeta = null;
 
     // Construir el nivel UNA sola vez (no dentro de animate, que corre 60 veces por segundo)
     construirNivel();
+    reaparecerJugador();               // ubicar al jugador en la "P"
+    camera.position.set(8, 4.5, 14);
 
     ui.inicio.classList.add('oculto');
     ui.fin.classList.add('oculto');
     ui.pausa.classList.add('oculto');
+
+    estado = 'jugando';                // ← sin esto, el bucle nunca actualiza al jugador
+}
+
+// ********************************************
+// CÁMARA QUE SIGUE AL JUGADOR
+// Interpolación (lerp): en cada cuadro la cámara recorre un porcentaje
+// de la distancia hacia su objetivo → movimiento suave.
+// ********************************************
+function actualizarCamara(dt) {
+    const suavizado = Math.min(1, 5 * dt);
+    const objetivoX = Math.max(8, jugador.x + 2);   // un poco adelante del jugador
+    const objetivoY = Math.max(4.5, jugador.y + 3);
+
+    camera.position.x += (objetivoX - camera.position.x) * suavizado;
+    camera.position.y += (objetivoY - camera.position.y) * suavizado;
+    camera.position.z = 14;
+    camera.lookAt(camera.position.x, camera.position.y - 2, 0);
+}
+
+// ---------- Bucle principal (game loop) ----------
+// requestAnimationFrame llama a esta función ~60 veces por segundo.
+// dt (delta time) = segundos desde el cuadro anterior. Multiplicar las
+// velocidades por dt hace que el juego vaya igual en PCs rápidos y lentos.
+const reloj = new THREE.Clock();
+
+function bucle() {
+  requestAnimationFrame(bucle);
+  const dt = Math.min(reloj.getDelta(), 1 / 30);   // limitamos dt para evitar "teletransportes"
+  const tiempo = reloj.elapsedTime;
+
+  if (estado === 'jugando') {
+    actualizarJugador(dt);
+    //actualizarEnemigos(dt);
+    tiempoRestante -= dt;
+    if (tiempoRestante <= 0) { tiempoRestante = 0; /* perderVida(true); */ }
+  } else if (estado === 'muriendo') {
+    //actualizarMuerte(dt);
+  }
+
+  if (estado !== 'pausa' && grupoNivel) {
+    //actualizarParticulas(dt);
+    //animarNivel(dt, tiempo);
+  }
+  if (estado !== 'inicio') {
+    actualizarCamara(dt);
+    //actualizarHUD();
+  } else {
+    // En la pantalla de inicio la cámara recorre el nivel lentamente
+    camera.position.x = 10 + Math.sin(tiempo * 0.2) * 6;
+    camera.position.y = 5;
+    camera.lookAt(camera.position.x, 3, 0);
+    light.position.set(camera.position.x - 6, 18, 12);
+    //light.target.position.set(camera.position.x, 0, 0);
+  }
+
+  renderer.render(scene, camera);
 }
 
 
-
-function animate(time) {
-    renderer.render(scene, camera);
-
-}
+// ARRANQUE DE LA ESCENA
+construirNivel();
+reaparecerJugador();           // el jugador aparece en la "P" desde la pantalla de inicio
+actualizarModeloJugador(0);
+bucle();
