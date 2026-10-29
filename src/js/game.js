@@ -131,7 +131,7 @@ function construirNivel() {
 const textureLoader = new THREE.TextureLoader();
 // 2. Cargar la imagen especificando su ruta (local o URL externa)
 const texTierra = textureLoader.load('./src/img/texture/ground.jpg');
-const texSuelo = textureLoader.load('./src/img/texture/pasto.jpg');
+const texSuelo = textureLoader.load('./src/img/texture/grass.jpg');
 const texLadrillo = textureLoader.load('./src/img/texture/ladrillo.jpg');
 texLadrillo.colorSpace = THREE.SRGBColorSpace;
 
